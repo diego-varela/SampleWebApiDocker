@@ -1,0 +1,63 @@
+name: Test OIDC Federation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Imprescindible: sin esto GitHub no emite el token OIDC
+  contents: read
+
+jobs:
+  test-oidc:
+    runs-on: ubuntu-latest
+    environment: production   # Hace que sub = repo:<org>/<repo>:environment:production
+
+    steps:
+      # ── Paso A: decodificar el JWT antes de enviarlo a AWS ────────────────
+      # Permite ver los claims exactos (sub, aud, iss) que recibirá la Trust Policy.
+      # Útil para diagnosticar si configure-aws-credentials falla.
+      - name: Decodificar claims del token OIDC
+        run: |
+          TOKEN=$(curl -s \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
+          echo "$TOKEN" | python3 -c "
+          import sys, json, base64
+          t = json.load(sys.stdin)['value'].split('.')[1]
+          t += '=' * (4 - len(t) % 4)
+          claims = json.loads(base64.b64decode(t))
+          print(json.dumps(claims, indent=2))
+          "
+
+      # ── Paso B: intercambiar el JWT por credenciales temporales de AWS ────
+      # La action envía el JWT a STS. AWS verifica la firma contra el JWKS
+      # público de GitHub y valida los claims contra la Trust Policy del rol.
+      - name: Obtener credenciales temporales via OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GitHubActions-OIDC-Test
+
+      # ── Paso C: inspeccionar las credenciales temporales ─────────────────
+      # configure-aws-credentials inyecta tres variables de entorno:
+      #   AWS_ACCESS_KEY_ID     → visible (ASIA = temporal, AKIA = permanente)
+      #   AWS_SECRET_ACCESS_KEY → enmascarado automáticamente por la action (---)
+      #   AWS_SESSION_TOKEN     → enmascarado automáticamente por la action (---)
+      - name: Inspeccionar credenciales temporales
+        run: |
+          echo "=== Fuente de credenciales ==="
+          aws configure list
+
+          echo ""
+          echo "=== Access Key ID (ASIA = temporal, AKIA = permanente) ==="
+          echo "AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID"
+
+          echo ""
+          echo "=== Secret y Token (enmascarados por configure-aws-credentials) ==="
+          echo "AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY"
+          echo "AWS_SESSION_TOKEN: $AWS_SESSION_TOKEN"
+
+          echo ""
+          echo "=== Identidad y nombre de sesión ==="
+          aws sts get-caller-identity
